@@ -1,0 +1,509 @@
+Index: src/chrome/browser/ui/views/frame/browser_frame_view_mac.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/browser_frame_view_mac.h
++++ src/chrome/browser/ui/views/frame/browser_frame_view_mac.h
+@@ -26,6 +26,7 @@ enum class ToolbarVisibilityStyle;
+ }
+ 
+ @class FullscreenToolbarController;
++@class NSVisualEffectView;
+ 
+ class CaptionButtonPlaceholderContainer;
+ 
+@@ -93,6 +94,9 @@ class BrowserFrameViewMac : public Brows
+   int TopUIFullscreenYOffset() const;
+   void LayoutWindowControlsOverlay();
+ 
++  // Installs and positions the native macOS material behind the top chrome.
++  void UpdateToolbarBackdrop();
++
+   void UpdateCaptionButtonPlaceholderContainerBackground();
+ 
+   // Toggle the visibility of the web_app_frame_toolbar_view() for PWAs with
+@@ -115,6 +119,7 @@ class BrowserFrameViewMac : public Brows
+       caption_button_placeholder_container_ = nullptr;
+ 
+   FullscreenToolbarController* __strong fullscreen_toolbar_controller_;
++  NSVisualEffectView* __strong toolbar_backdrop_view_;
+ 
+   // Mark the start of a fullscreen session. Applies to both immersive and
+   // standard fullscreen.
+Index: src/chrome/browser/ui/views/frame/browser_frame_view_mac.mm
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/browser_frame_view_mac.mm
++++ src/chrome/browser/ui/views/frame/browser_frame_view_mac.mm
+@@ -35,6 +35,7 @@
+ #include "chrome/browser/ui/views/frame/caption_button_placeholder_container.h"
+ #include "chrome/browser/ui/views/frame/immersive_mode_controller.h"
+ #include "chrome/browser/ui/views/frame/tab_strip_region_view.h"
++#include "chrome/browser/ui/views/frame/top_container_view.h"
+ #include "chrome/browser/ui/views/tabs/tab_strip.h"
+ #include "chrome/browser/ui/views/toolbar/toolbar_view.h"
+ #include "chrome/browser/ui/views/web_apps/frame_toolbar/web_app_frame_toolbar_utils.h"
+@@ -54,6 +55,7 @@
+ #include "ui/gfx/geometry/rect_conversions.h"
+ #include "ui/gfx/geometry/rect_f.h"
+ #include "ui/gfx/geometry/size.h"
++#include "ui/gfx/native_ui_types.h"
+ #include "ui/views/cocoa/native_widget_mac_ns_window_host.h"
+ #include "ui/views/controls/label.h"
+ #include "ui/views/layout/layout_types.h"
+@@ -70,6 +72,12 @@ FullscreenToolbarStyle GetUserPreferredT
+                      : FullscreenToolbarStyle::TOOLBAR_HIDDEN;
+ }
+ 
++bool CanShowToolbarBackdrop(const BrowserView* browser_view) {
++  return browser_view->GetIsNormalType() && browser_view->GetTabStripVisible() &&
++         !browser_view->IsFullscreen() &&
++         !browser_view->ShouldDrawVerticalTabStrip();
++}
++
+ }  // namespace
+ 
+ ///////////////////////////////////////////////////////////////////////////////
+@@ -108,6 +116,7 @@ BrowserFrameViewMac::BrowserFrameViewMac
+ }
+ 
+ BrowserFrameViewMac::~BrowserFrameViewMac() {
++  [toolbar_backdrop_view_ removeFromSuperview];
+   if ([fullscreen_toolbar_controller_ isInFullscreen]) {
+     [fullscreen_toolbar_controller_ exitFullscreenMode];
+   }
+@@ -162,6 +171,7 @@ void BrowserFrameViewMac::OnFullscreenSt
+     [fullscreen_toolbar_controller_ exitFullscreenMode];
+   }
+   GetBrowserView()->DeprecatedLayoutImmediately();
++  UpdateToolbarBackdrop();
+ }
+ 
+ void BrowserFrameViewMac::OnTabStripStateChanged() {
+@@ -180,6 +190,7 @@ void BrowserFrameViewMac::OnTabStripStat
+   [window setStyleMask:style_mask ^ NSWindowStyleMaskFullSizeContentView];
+   [window setStyleMask:style_mask];
+   [window setFrame:frame display:YES];
++  UpdateToolbarBackdrop();
+ }
+ 
+ bool BrowserFrameViewMac::CaptionButtonsOnLeadingEdge() const {
+@@ -309,11 +320,13 @@ bool BrowserFrameViewMac::ShouldHideTopU
+ void BrowserFrameViewMac::UpdateThrobber(bool running) {}
+ 
+ void BrowserFrameViewMac::PaintAsActiveChanged() {
++  UpdateToolbarBackdrop();
+   UpdateCaptionButtonPlaceholderContainerBackground();
+   BrowserFrameView::PaintAsActiveChanged();
+ }
+ 
+ void BrowserFrameViewMac::OnThemeChanged() {
++  UpdateToolbarBackdrop();
+   UpdateCaptionButtonPlaceholderContainerBackground();
+   BrowserFrameView::OnThemeChanged();
+ }
+@@ -475,7 +488,11 @@ void BrowserFrameViewMac::OnPaint(gfx::C
+     return;
+   }
+ 
+-  canvas->DrawColor(GetColorProvider()->GetColor(kColorToolbar));
++  SkColor toolbar_color = GetColorProvider()->GetColor(kColorToolbar);
++  if (toolbar_backdrop_view_ && ![toolbar_backdrop_view_ isHidden]) {
++    toolbar_color = SkColorSetA(toolbar_color, 0x2E);
++  }
++  canvas->DrawColor(toolbar_color);
+ 
+   auto* theme_service = ThemeServiceFactory::GetForProfile(
+       GetBrowserView()->browser()->profile());
+@@ -489,6 +506,7 @@ void BrowserFrameViewMac::Layout(PassKey
+     LayoutWindowControlsOverlay();
+   }
+   LayoutSuperclass<BrowserFrameView>(this);
++  UpdateToolbarBackdrop();
+ }
+ 
+ ///////////////////////////////////////////////////////////////////////////////
+@@ -547,6 +565,50 @@ void BrowserFrameViewMac::LayoutWindowCo
+   caption_button_placeholder_container_->SetBoundsRect(container_bounds);
+ }
+ 
++void BrowserFrameViewMac::UpdateToolbarBackdrop() {
++  NSWindow* window = GetWidget()->GetNativeWindow().GetNativeNSWindow();
++  if (!window) {
++    return;
++  }
++
++  NSView* host_view = GetWidget()->GetNativeView().GetNativeNSView();
++  NSView* superview = [host_view superview];
++  if (!superview) {
++    return;
++  }
++
++  const bool should_show = CanShowToolbarBackdrop(GetBrowserView()) &&
++                           GetBrowserView()->top_container()->height() > 0;
++  if (!should_show) {
++    [toolbar_backdrop_view_ setHidden:YES];
++    return;
++  }
++
++  if (!toolbar_backdrop_view_) {
++    toolbar_backdrop_view_ =
++        [[NSVisualEffectView alloc] initWithFrame:NSZeroRect];
++    [toolbar_backdrop_view_ setAutoresizingMask:NSViewWidthSizable |
++                                                NSViewMinYMargin];
++    [toolbar_backdrop_view_
++        setMaterial:NSVisualEffectMaterialUnderWindowBackground];
++    [toolbar_backdrop_view_
++        setBlendingMode:NSVisualEffectBlendingModeBehindWindow];
++    [toolbar_backdrop_view_
++        setState:NSVisualEffectStateFollowsWindowActiveState];
++  }
++
++  if ([toolbar_backdrop_view_ superview] != superview) {
++    [toolbar_backdrop_view_ removeFromSuperview];
++    [superview addSubview:toolbar_backdrop_view_
++               positioned:NSWindowBelow
++               relativeTo:host_view];
++  }
++
++  NSRect backdrop_frame = [superview bounds];
++  [toolbar_backdrop_view_ setFrame:backdrop_frame];
++  [toolbar_backdrop_view_ setHidden:NO];
++}
++
+ void BrowserFrameViewMac::UpdateCaptionButtonPlaceholderContainerBackground() {
+   if (caption_button_placeholder_container_) {
+     caption_button_placeholder_container_->SetBackground(
+Index: src/chrome/browser/ui/views/frame/custom_corners.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/custom_corners.cc
++++ src/chrome/browser/ui/views/frame/custom_corners.cc
+@@ -5,6 +5,7 @@
+ #include "chrome/browser/ui/views/frame/custom_corners.h"
+ 
+ #include "base/check_op.h"
++#include "build/build_config.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/frame/themed_background.h"
+ #include "ui/gfx/scoped_canvas.h"
+@@ -49,6 +50,12 @@ void CustomCorners::PaintPath(gfx::Canva
+                               ColorChoice color_choice,
+                               bool anti_alias) const {
+   auto paint_color = [&](ColorChoice choice, float alpha) {
++#if BUILDFLAG(IS_MAC)
++    if (browser_view().GetIsNormalType() &&
++        std::holds_alternative<ToolbarTheme>(choice)) {
++      alpha = 0.0f;
++    }
++#endif
+     if (std::holds_alternative<ToolbarTheme>(choice) ||
+         std::holds_alternative<FrameTheme>(choice)) {
+       gfx::ScopedCanvas scoped(canvas);
+Index: src/chrome/browser/ui/views/frame/themed_background.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/themed_background.cc
++++ src/chrome/browser/ui/views/frame/themed_background.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <optional>
+ 
++#include "build/build_config.h"
+ #include "chrome/browser/themes/theme_properties.h"
+ #include "chrome/browser/ui/color/chrome_color_id.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+@@ -96,8 +97,15 @@ void ThemedBackground::PaintBackground(g
+   bool painted =
+       PaintThemeCustomImage(canvas, view, browser_view, theme_choice);
+   if (!painted) {
+-    canvas->DrawColor(view->GetColorProvider()->GetColor(
+-        GetThemeChoiceInfo(theme_choice, view).second));
++    SkColor color = view->GetColorProvider()->GetColor(
++        GetThemeChoiceInfo(theme_choice, view).second);
++#if BUILDFLAG(IS_MAC)
++    if (browser_view->GetIsNormalType() &&
++        theme_choice == ThemedBackground::ThemeChoice::kToolbarTheme) {
++      color = SkColorSetA(color, SK_AlphaTRANSPARENT);
++    }
++#endif
++    canvas->DrawColor(color);
+   }
+ }
+ 
+@@ -110,7 +118,14 @@ std::optional<SkColor> ThemedBackground:
+   const bool will_be_painted =
+       WillPaintCustomImage(view, theme_choice_info.first);
+   if (!will_be_painted) {
+-    return view->GetColorProvider()->GetColor(theme_choice_info.second);
++    SkColor color = view->GetColorProvider()->GetColor(theme_choice_info.second);
++#if BUILDFLAG(IS_MAC)
++    if (browser_view->GetIsNormalType() &&
++        theme_choice == ThemedBackground::ThemeChoice::kToolbarTheme) {
++      color = SkColorSetA(color, SK_AlphaTRANSPARENT);
++    }
++#endif
++    return color;
+   }
+ 
+   return std::nullopt;
+Index: src/chrome/browser/ui/views/frame/browser_native_widget_mac.mm
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/browser_native_widget_mac.mm
++++ src/chrome/browser/ui/views/frame/browser_native_widget_mac.mm
+@@ -570,6 +570,10 @@ views::Widget::InitParams BrowserNativeW
+     views::Widget::InitParams::Ownership ownership) {
+   views::Widget::InitParams params(ownership);
+   params.native_widget = this;
++  if (browser_view_ && browser_view_->GetIsNormalType() &&
++      !browser_view_->ShouldDrawVerticalTabStrip()) {
++    params.opacity = views::Widget::InitParams::WindowOpacity::kTranslucent;
++  }
+   return params;
+ }
+ 
+Index: src/chrome/browser/ui/views/frame/browser_root_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/browser_root_view.cc
++++ src/chrome/browser/ui/views/frame/browser_root_view.cc
+@@ -18,7 +18,9 @@
+ #include "base/functional/bind.h"
+ #include "base/functional/callback_helpers.h"
+ #include "base/metrics/user_metrics.h"
++#include "base/numerics/safe_conversions.h"
+ #include "base/task/thread_pool.h"
++#include "build/build_config.h"
+ #include "chrome/browser/autocomplete/autocomplete_classifier_factory.h"
+ #include "chrome/browser/defaults.h"
+ #include "chrome/browser/profiles/profile.h"
+@@ -498,11 +500,17 @@ void BrowserRootView::PaintChildren(cons
+   const auto* widget = GetWidget();
+   DCHECK(widget);
+ 
+-  const SkColor toolbar_top_separator_color =
++  SkColor toolbar_top_separator_color =
+       widget->GetColorProvider()->GetColor(
+-          GetWidget()->ShouldPaintAsActive()
++          widget->ShouldPaintAsActive()
+               ? kColorToolbarTopSeparatorFrameActive
+               : kColorToolbarTopSeparatorFrameInactive);
++#if BUILDFLAG(IS_MAC)
++  toolbar_top_separator_color =
++      SkColorSetA(toolbar_top_separator_color,
++                  base::ClampRound(SkColorGetA(toolbar_top_separator_color) *
++                                   0.0f));
++#endif
+ 
+   cc::PaintFlags flags;
+   flags.setColor(toolbar_top_separator_color);
+Index: src/chrome/browser/ui/views/frame/contents_container_outline.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/contents_container_outline.cc
++++ src/chrome/browser/ui/views/frame/contents_container_outline.cc
+@@ -5,6 +5,8 @@
+ #include "chrome/browser/ui/views/frame/contents_container_outline.h"
+ 
+ #include "base/i18n/rtl.h"
++#include "build/build_config.h"
++#include "chrome/browser/ui/color/chrome_color_id.h"
+ #include "chrome/browser/ui/ui_features.h"
+ #include "third_party/skia/include/core/SkMatrix.h"
+ #include "third_party/skia/include/core/SkPath.h"
+@@ -116,7 +118,13 @@ void ContentsContainerOutline::OnPaint(g
+   // Draw the bordering stroke.
+   cc::PaintFlags flags;
+   flags.setStrokeWidth(GetThickness(is_highlighted_));
+-  flags.setColor(GetColorProvider()->GetColor(stroke_color_));
++  SkColor stroke_color = GetColorProvider()->GetColor(stroke_color_);
++#if BUILDFLAG(IS_MAC)
++  if (!is_highlighted_ && stroke_color_ == kColorToolbarContentAreaSeparator) {
++    stroke_color = SkColorSetA(stroke_color, SK_AlphaTRANSPARENT);
++  }
++#endif
++  flags.setColor(stroke_color);
+   flags.setStyle(cc::PaintFlags::kStroke_Style);
+   flags.setAntiAlias(true);
+ 
+Index: src/chrome/browser/ui/views/frame/contents_separator.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/contents_separator.cc
++++ src/chrome/browser/ui/views/frame/contents_separator.cc
+@@ -7,6 +7,7 @@
+ #include <memory>
+ 
+ #include "base/memory/ptr_util.h"
++#include "build/build_config.h"
+ #include "chrome/browser/ui/color/chrome_color_id.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
+ #include "ui/color/color_provider.h"
+@@ -31,10 +32,14 @@ ContentsSeparator::CreateContentsSeparat
+ }
+ 
+ ContentsSeparator::ContentsSeparator(bool create_layer) {
++#if BUILDFLAG(IS_MAC)
++  SetBackground(nullptr);
++#else
+   SetBackground(create_layer ? views::CreateLayerBasedSolidBackground(
+                                    kColorToolbarContentAreaSeparator)
+                              : views::CreateSolidBackground(
+                                    kColorToolbarContentAreaSeparator));
++#endif
+ 
+   // BrowserViewLayout will respect either the height or width of this,
+   // depending on orientation, not simultaneously both.
+Index: src/chrome/browser/ui/tabs/tab_style.cc
+===================================================================
+--- src.orig/chrome/browser/ui/tabs/tab_style.cc
++++ src/chrome/browser/ui/tabs/tab_style.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <array>
+ 
++#include "build/build_config.h"
+ #include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/tabs/features.h"
+ #include "ui/base/ui_base_features.h"
+@@ -224,6 +225,22 @@ SkColor TabStyle::GetTabBackgroundColor(
+     return gfx::kPlaceholderColor;
+   }
+ 
++#if BUILDFLAG(IS_MAC)
++  // Keep horizontal tabs independent from themes on macOS so they read as
++  // native material layers over the toolbar blur.
++  switch (state) {
++    case TabStyle::TabSelectionState::kActive:
++      return SkColorSetARGB(0x1B, 0xFF, 0xFF, 0xFF);
++    case TabStyle::TabSelectionState::kSelected:
++      return SkColorSetARGB(hovered ? 0x22 : 0x1B, 0xFF, 0xFF, 0xFF);
++    case TabStyle::TabSelectionState::kInactive:
++      return hovered ? SkColorSetARGB(0x13, 0xFF, 0xFF, 0xFF)
++                     : SK_ColorTRANSPARENT;
++    default:
++      NOTREACHED();
++  }
++#endif
++
+   switch (state) {
+     case TabStyle::TabSelectionState::kActive: {
+       constexpr std::array<ui::ColorId, 2> kActiveColorIds = {
+Index: src/chrome/browser/ui/views/location_bar/location_bar_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/location_bar/location_bar_view.cc
++++ src/chrome/browser/ui/views/location_bar/location_bar_view.cc
+@@ -1514,6 +1514,13 @@ void LocationBarView::RefreshBackground(
+   SkColor hovered =
+       color_provider->GetColor(kColorLocationBarBackgroundHovered);
+ 
++#if BUILDFLAG(IS_MAC)
++  if (!high_contrast) {
++    normal = SkColorSetARGB(0x1B, 0xFF, 0xFF, 0xFF);
++    hovered = SkColorSetARGB(0x22, 0xFF, 0xFF, 0xFF);
++  }
++#endif
++
+   background_color_ = gfx::Tween::ColorValueBetween(opacity, normal, hovered);
+   if (is_caret_visible) {
+     // Match the background color to the popup if the Omnibox is visibly
+@@ -1554,7 +1561,14 @@ void LocationBarView::RefreshBackground(
+ 
+   // Keep the views::Textfield in sync. It needs an opaque background to
+   // correctly enable subpixel AA.
++#if BUILDFLAG(IS_MAC)
++  omnibox_view_->SetBackgroundColor(
++      high_contrast || is_caret_visible || input_in_progress
++          ? background_color_
++          : SK_ColorTRANSPARENT);
++#else
+   omnibox_view_->SetBackgroundColor(background_color_);
++#endif
+ 
+   // The divider between indicators and request chips should have the same color
+   // as the omnibox.
+Index: src/chrome/browser/ui/views/tabs/tab_strip_control_button.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/tab_strip_control_button.cc
++++ src/chrome/browser/ui/views/tabs/tab_strip_control_button.cc
+@@ -7,6 +7,7 @@
+ #include <optional>
+ #include <utility>
+ 
++#include "build/build_config.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/views/frame/browser_frame_view.h"
+@@ -326,6 +327,11 @@ void TabStripControlButton::UpdateColors
+   SchedulePaint();
+ }
+ 
++void TabStripControlButton::StateChanged(ButtonState old_state) {
++  LabelButton::StateChanged(old_state);
++  UpdateBackground();
++}
++
+ void TabStripControlButton::NotifyClick(const ui::Event& event) {
+   LabelButton::NotifyClick(event);
+   views::InkDrop::Get(this)->GetInkDrop()->AnimateToState(
+@@ -349,17 +355,40 @@ void TabStripControlButton::UpdateBackgr
+                                BrowserFrameActiveState::kUseCurrent)
+                          : std::nullopt;
+ 
++  const float right_corner_radius =
++      GetScaledCornerRadius(GetRightCornerRadius(), Edge::kRight);
++  const float left_corner_radius =
++      GetScaledCornerRadius(GetLeftCornerRadius(), Edge::kLeft);
++  SkColor background_color = color_provider->GetColor(GetBackgroundColor());
++#if BUILDFLAG(IS_MAC)
++  switch (GetState()) {
++    case ButtonState::STATE_NORMAL:
++      background_color = SK_ColorTRANSPARENT;
++      break;
++    case ButtonState::STATE_HOVERED:
++      background_color = SkColorSetARGB(0x13, 0xFF, 0xFF, 0xFF);
++      break;
++    case ButtonState::STATE_PRESSED:
++      background_color = SkColorSetARGB(0x1B, 0xFF, 0xFF, 0xFF);
++      break;
++    case ButtonState::STATE_DISABLED:
++      background_color = SK_ColorTRANSPARENT;
++      break;
++  }
++#endif
++
+   // Paint the background as transparent for image based themes.
+-  if (bg_id.has_value() && paint_transparent_for_custom_image_theme_) {
++  bool paint_transparent_for_custom_image_theme =
++      bg_id.has_value() && paint_transparent_for_custom_image_theme_;
++#if BUILDFLAG(IS_MAC)
++  paint_transparent_for_custom_image_theme = false;
++#endif
++  if (paint_transparent_for_custom_image_theme) {
+     SetBackground(views::CreateSolidBackground(SK_ColorTRANSPARENT));
+   } else {
+-    const float right_corner_radius =
+-        GetScaledCornerRadius(GetRightCornerRadius(), Edge::kRight);
+-    const float left_corner_radius =
+-        GetScaledCornerRadius(GetLeftCornerRadius(), Edge::kLeft);
+     SetBackground(views::CreateBackgroundFromPainter(
+         views::Painter::CreateSolidRoundRectPainterWithVariableRadius(
+-            color_provider->GetColor(GetBackgroundColor()),
++            background_color,
+             gfx::RoundedCornersF(left_corner_radius, right_corner_radius,
+                                  right_corner_radius, left_corner_radius),
+             GetInsets())));
+@@ -374,6 +403,9 @@ void TabStripControlButton::UpdateInkDro
+ 
+   CreateToolbarInkdropCallbacks(this, inkdrop_hover_color_id_,
+                                 inkdrop_ripple_color_id_);
++#if BUILDFLAG(IS_MAC)
++  views::InkDrop::Get(this)->GetInkDrop()->SetShowHighlightOnHover(false);
++#endif
+ }
+ 
+ bool TabStripControlButton::IsWidgetAlive() const {
+Index: src/chrome/browser/ui/views/tabs/tab_strip_control_button.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/tab_strip_control_button.h
++++ src/chrome/browser/ui/views/tabs/tab_strip_control_button.h
+@@ -124,6 +124,7 @@ class TabStripControlButton : public vie
+   virtual void UpdateColors();
+ 
+   // views::Button
++  void StateChanged(ButtonState old_state) override;
+   void NotifyClick(const ui::Event& event) override;
+ 
+   void set_paint_transparent_for_custom_image_theme(
